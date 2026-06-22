@@ -11,7 +11,7 @@ from core.connectivity import send_data
 from utils.helper import time_stamp_fnamer, delete_files, config
 from utils.logging import initialize_logging, log_time_remaining, write_rain_data_to_csv
 from utils.dir import get_data_dir
-from utils.audio_rec import record_audio
+from utils.audio_rec import record_audio, AudioManager
 
 
 class AcousticRaingauge:
@@ -21,52 +21,33 @@ class AcousticRaingauge:
         self.num_subsamples = config["infer_inetrval_sec"] // config["sample_duration_sec"]
         self.record_hours = config["record_hours"]
         self.end_time = datetime.now() + timedelta(hours=self.record_hours)
-        self.moisture_threshold = config["field_deployed"]
+        self.deployed = config["field_deployed"]
         self.min_threshold = config["min_threshold"]
         self.moisture_threshold = config["moisture_threshold"]
 
         self.acoustic_model = RainfallEstimator()
         self.battery = BatteryMonitor()
         self.moisture_sensor = MoistureSensor()
+        self.audio_recorder = AudioManager()
 
     def run(self):
         db_counter, rain = 0, 0
         locations = []
         result_data = []
         data_dir = get_data_dir()
+        
+        # audio recording thread
+        rain_thread = threading.Thread(target=self.audio_recorder.run, daemon=True).start()
 
         try:
-            if self.moisture_threshold:
-                i = 1 # audio sample number
+            if self.deployed:
                 while True:
-                    dt_now = datetime.now()
-                    print(f"Recording sample number {i} on {dt_now}")
-                    audio_fname = time_stamp_fnamer(dt_now) + ".wav"
-                    location = path.join(data_dir, audio_fname)
-                    record_audio(
-                        location,
-                        config["sample_duration_sec"],
-                        config["file_format"],
-                        config["resolution"],
-                        config["sampling_rate"],
-                    )
-                    locations.append(location)
+                    if self.audio_recorder.is_ready():
+                        audio_samples = self.audio_sample_buffer.get_window()
+                        rain_mm = self.acoustic_model.estimate_rainfall(audio_samples) # inference
+                        print("Estimated rainfall: ", rain_mm)
 
-                    if i % self.num_subsamples == 0: # if (infer_inetrval // wav_duration) no of audio subsamples are collected
-                        mm_hat = self.acoustic_model.estimate_rainfall(locations) # estimating rainfall
-                        print("Estimated rainfall: ", mm_hat)
-
-                        files_and_directories = listdir(data_dir)
-                        files_to_delete = [
-                            path.join(data_dir, f)
-                            for f in files_and_directories
-                            if path.isfile(path.join(data_dir, f))
-                        ]
-
-                        delete_files(files_to_delete)
-                        locations.clear()
-
-                        rain += mm_hat
+                        rain += rain_mm
                         db_counter += 1
 
                         # reading moisture sensor
@@ -83,7 +64,6 @@ class AcousticRaingauge:
                             else:
                                 send_data(config, 0.0, solar_V, battery_V, solar_I, battery_I)
                             rain, db_counter = 0, 0
-                    i += 1
 
             else:
                 # run mechanical raingauge in new thread
@@ -100,13 +80,7 @@ class AcousticRaingauge:
                     logger.info(f"Recording sample number {i} on {dt_now}")
                     audio_fname = time_stamp_fnamer(dt_now) + ".wav"
                     location = path.join(data_dir, audio_fname)
-                    record_audio(
-                        location,
-                    config["sample_duration_sec"],
-                        config["file_format"],
-                        config["resolution"],
-                        config["sampling_rate"],
-                    )
+                    self.audio_recorder.record_audio(location)
                     locations.append(location)
 
                     if i % self.num_subsamples == 0: # estimating rainfall
